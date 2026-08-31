@@ -30,14 +30,22 @@ x-qwen: &qwen
       required: false
   environment:
     HOME: /cache
+    PORT: ${PORT:-1234}
+    # Qwen 3.8 supports up to 262144 tokens; override with MAX_LEN in .env if needed.
+    MAX_LEN: ${MAX_LEN:-262144}
+    # Keep the multimodal vision tower loaded for image inputs. CPU offload is
+    # required by default on a 24 GB card to leave room for the language model.
+    VISION: ${VISION:-1}
+    VISION_OFFLOAD: ${VISION_OFFLOAD:-1}
   volumes:
     - ${MODELS_DIR:-./models}:/app/models
     - qwen-cache:/cache
 
 x-serve: &serve
   <<: *qwen
+  restart: unless-stopped
   ports:
-    - "${PORT:-18020}:${PORT:-18020}"
+    - "${PORT:-1234}:${PORT:-1234}"
   depends_on:
     prepare:
       condition: service_completed_successfully
@@ -45,13 +53,14 @@ x-serve: &serve
     resources:
       reservations:
         devices:
+          # Two GPUs for --tensor-parallel-size 2 (set EXTRA_ARGS in .env).
           - driver: nvidia
-            count: 1
+            count: 2
             capabilities: [gpu]
-  restart: unless-stopped
   stop_grace_period: 30s
+  stop_signal: SIGTERM
   healthcheck:
-    test: ["CMD", "curl", "-sf", "http://127.0.0.1:${PORT:-18020}/health"]
+    test: ["CMD", "curl", "-sf", "http://127.0.0.1:${PORT:-1234}/health"]
     interval: 30s
     timeout: 5s
     retries: 3
