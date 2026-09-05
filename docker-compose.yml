@@ -33,10 +33,14 @@ x-qwen: &qwen
     PORT: ${PORT:-1234}
     # Qwen 3.8 supports up to 262144 tokens; override with MAX_LEN in .env if needed.
     MAX_LEN: ${MAX_LEN:-262144}
-    # Keep the multimodal vision tower loaded for image inputs. CPU offload is
-    # required by default on a 24 GB card to leave room for the language model.
+    # Keep the multimodal vision tower loaded for image inputs.
+    # VISION_OFFLOAD defaults to 0: both GPUs are reserved below, so the tower
+    # stays resident in VRAM with no CPU offload. Set VISION_OFFLOAD=1 in .env
+    # only for a single-GPU 24 GB host where the tower must live in pinned RAM.
     VISION: ${VISION:-1}
-    VISION_OFFLOAD: ${VISION_OFFLOAD:-1}
+    VISION_OFFLOAD: ${VISION_OFFLOAD:-0}
+    # Tensor-parallel across both reserved GPUs; override in .env if needed.
+    EXTRA_ARGS: ${EXTRA_ARGS:---tensor-parallel-size 2}
   volumes:
     - ${MODELS_DIR:-./models}:/app/models
     - qwen-cache:/cache
@@ -53,7 +57,7 @@ x-serve: &serve
     resources:
       reservations:
         devices:
-          # Two GPUs for --tensor-parallel-size 2 (set EXTRA_ARGS in .env).
+          # Two GPUs with --tensor-parallel-size 2 (default EXTRA_ARGS above).
           - driver: nvidia
             count: 2
             capabilities: [gpu]
