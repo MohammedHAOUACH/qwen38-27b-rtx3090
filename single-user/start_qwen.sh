@@ -456,9 +456,19 @@ TOOL_ARGS=$([ "${TOOLS:-1}" = 1 ] && echo --enable-auto-tool-choice --tool-call-
 # be overridden from EXTRA_ARGS, which is expanded after them. The pixel cap is
 # shipped rather than left to the processor default because vLLM profiles the encoder
 # at the largest image it will accept, and that peak comes out of the KV pool:
-# 2097152 px = 2048 image tokens.
+# 1048576 px = 1024 image tokens.
+# MM_COUNT is the images-per-prompt cap (--limit-mm-per-prompt) and MM_LONGEST the
+# per-image pixel cap (longest_edge, the tall side); the shortest_edge of 65536 px
+# floors small images instead of letting the processor downscale them away. Both are
+# knobs: with MM_LONGEST=2097152 an image can reach 2048 image tokens, and at 8192
+# patches the encoder forward measured 296 ms resident vs 333 ms offloaded — see the
+# VISION_OFFLOAD block below. 32 images x 1024 tokens = 32k image tokens worst case,
+# which fits CTX=huge; raising MM_COUNT further only shifts text context if the
+# images are actually that large.
+MM_COUNT=${MM_COUNT:-32}
+MM_LONGEST=${MM_LONGEST:-1048576}
 if [ "${VISION:-0}" = 1 ]; then
-  VISION_ARGS='--limit-mm-per-prompt {"image":{"count":10}} --mm-processor-kwargs {"size":{"shortest_edge":65536,"longest_edge":2097152}}'
+  VISION_ARGS="--limit-mm-per-prompt {\"image\":{\"count\":$MM_COUNT}} --mm-processor-kwargs {\"size\":{\"shortest_edge\":65536,\"longest_edge\":$MM_LONGEST}}"
   # VISION_OFFLOAD keeps the tower's weights in pinned host RAM and copies each module to
   # the GPU for the duration of its own forward (patches/vision-tower-cpu-offload.patch).
   # It defaults ON, because on 24 GB SPEC=dflash2 + VISION=1 does not boot without it:

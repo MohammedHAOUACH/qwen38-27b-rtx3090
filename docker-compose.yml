@@ -8,7 +8,9 @@
 # Knobs go in a .env file next to this file (never committed): VLLM_API_KEY=...,
 # and any of the start-script variables (CTX, KV, MAX_LEN, MAX_SEQS, GPU_UTIL, VISION,
 # SPEC_ATTN, DRAFT_TOKENS, EXTRA_ARGS, ...) — .env is passed straight into the
-# container. Fastest single-user decode, if the card is yours alone (README,
+# container -- VLLM_PP_LAYER_PARTITION included, if you switch to pipeline
+# parallelism (see EXTRA_ARGS below). Fastest single-user decode, if the card is
+# yours alone (README,
 # "If you are the only user"; the drafter it needs is already downloaded by
 # prepare):
 #
@@ -40,6 +42,17 @@ x-qwen: &qwen
     VISION: ${VISION:-1}
     VISION_OFFLOAD: ${VISION_OFFLOAD:-0}
     # Tensor-parallel across both reserved GPUs; override in .env if needed.
+    #
+    # An UNEVEN split (most of the model on one card) is not a tensor-parallel
+    # setting -- TP shards every weight 50/50. It needs pipeline parallelism plus
+    # VLLM_PP_LAYER_PARTITION="<layers per rank>" in .env (it must sum to
+    # num_hidden_layers, 64 here, and vLLM refuses to start otherwise). NOT SHIPPED
+    # as a default because PP and speculative decoding do not fit together in vLLM
+    # 0.27.1: neither drafter implements the SupportsPP protocol (dflash2 ->
+    # qwen3_dflash2.DFlash2Qwen3ForCausalLM, mtp -> qwen3_5_mtp.Qwen3_5MTP), so PP
+    # boots only with SPEC=none -- ~46 tok/s against ~122 with dflash2. Do not set
+    # VLLM_PP_LAYER_PARTITION here: with PP=1 vLLM rejects it outright
+    # ("len(partitions)=2 does not match pp_size=1").
     EXTRA_ARGS: ${EXTRA_ARGS:---tensor-parallel-size 2}
   volumes:
     - ${MODELS_DIR:-./models}:/app/models

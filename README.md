@@ -337,6 +337,81 @@ goes through untouched, via `EXTRA_ARGS`.
 EXTRA_ARGS="--tensor-parallel-size 2" bash single-user/start_qwen.sh
 ```
 
+#### Uneven links, and the layout that would fix them
+
+TP is symmetric: it shards every weight 50/50 and all-reduces the hidden state
+across the cards once per layer (two per layer, ~128 per decode step for this
+model's 64 layers). It cannot give one card the larger share of the model, and the
+narrowest link paces every collective. The layout that answers both is **pipeline
+parallel with an explicit per-stage layer count**:
+
+```bash
+EXTRA_ARGS="--pipeline-parallel-size 2" VLLM_PP_LAYER_PARTITION="44,20" \
+  bash single-user/start_qwen.sh
+```
+
+Read the widths off the box first — those numbers are for a host whose GPU 0 sits on
+PCIe 3.0 x8 and GPU 1 on x4, both behind the CPU, no NVLink:
+
+```bash
+nvidia-smi --query-gpu=index,pci.bus_id,pcie.link.gen.current,pcie.link.width.current --format=csv
+# index, pci.bus_id, pcie.link.gen.current, pcie.link.width.current
+# 0, 00000000:10:00.0, 3, 8     <- the card that should hold the larger share
+# 1, 00000000:21:00.0, 3, 4
+```
+
+`VLLM_PP_LAYER_PARTITION` (`vllm/distributed/utils.py`) is the mechanism, and it
+works: one layer count per PP rank, in rank order, summing to `num_hidden_layers`
+(64 here, `text_config`), with `get_pp_indices(64, 0, 2) == (0, 44)` and
+`(44, 64)` for the split above, and a loud refusal otherwise
+(`sum(partitions)=65 does not match num_hidden_layers=64`). **It is not shipped as a
+default here, because with a speculator it does not boot at all in vLLM 0.27.1:** the
+*draft* model config is checked for PP support first, and neither drafter this repo
+uses implements `SupportsPP` —
+
+```
+NotImplementedError: Pipeline parallelism is not supported for this model.
+Supported models implement the `SupportsPP` interface.
+```
+
+from `config/model.py:verify_with_parallel_config`, reached through
+`create_speculative_config` -> `SpeculativeConfig._verify_args` ->
+`draft_model_config.verify_with_parallel_config`:
+
+| model | class | `SupportsPP` |
+|---|---|---|
+| target | `qwen3_5.Qwen3_5ForConditionalGeneration` (via `qwen3_vl.Qwen3VLForConditionalGeneration`) | yes |
+| `SPEC=dflash2` drafter | `qwen3_dflash2.DFlash2Qwen3ForCausalLM` | no |
+| `SPEC=mtp` drafter | `qwen3_5_mtp.Qwen3_5MTP` | no |
+
+So PP boots with `SPEC=none` only, which on this model is ~2.4x slower to decode
+(46 tok/s against 111 with MTP and ~122 with DFlash2 in the table above). Porting the
+drafter to `SupportsPP` is the prerequisite, not a flag. Everything else about PP
+still holds — the link is crossed once per stage boundary instead of once per layer,
+a pipeline is paced by its slowest stage (so `batch` wants the even 32/32, i.e.
+`VLLM_PP_LAYER_PARTITION` unset), and filling it needs concurrent batches
+(`max_concurrent_batches` is `pp_size`).
+
+#### What the unequal links actually cost, measured
+
+2x RTX 3090 (x8 + x4, no NVLink, both behind the CPU), the symmetric split this repo
+ships, `TP=2 SPEC=dflash2 CTX=huge PREFIX_CACHE=1`, 262,144 max model len, a
+546,323-token pool (2.08x concurrency at 262k) and 15.6 GiB resident per card:
+
+| workload | measured |
+|---|---|
+| 142 tokens from a 63-token prompt | 129-137 tok/s end to end (two runs) |
+| prefill, 7,018-token prompt | 857 tok/s (8.19 s) |
+| prefill, 27,887-token prompt | 1,082 tok/s (25.78 s) |
+
+Those are the single-card `single-user` rates, not a link-limited subset of them, so
+the narrow link is not what a two-card run pays for at these lengths — do not
+"fix" it by dropping speculation, which is the only thing PP costs you here. If you
+need both cards working independently rather than one model across both, two
+replicas (each card holding the whole model, `--tensor-parallel-size 1`) remove the
+inter-GPU traffic entirely, at the price of the context a second copy of the weights
+leaves behind: ~16 GB per card before any KV pool.
+
 Reported working on **2x RTX 5060 Ti 16 GB** by
 [@antonybudianto](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/22) — two cards
 that could not hold this model individually. I have one 3090, so every multi-GPU
